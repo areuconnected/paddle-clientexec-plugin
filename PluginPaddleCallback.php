@@ -47,6 +47,36 @@ class PluginPaddleCallback extends PluginCallback
                 CE_Lib::log(1, "Paddle Callback Crash: " . $e->getMessage() . " in " . $e->getFile() . " on line " . $e->getLine());
             }
         }
+                elseif ($eventType === 'adjustment.updated') {
+            $adj = $innerData;
+            $status        = $adj['status'] ?? '';
+            $transactionId = $adj['transaction_id'] ?? '';
+
+            if ($status === 'approved' && $transactionId) {
+                CE_Lib::log(4, "Paddle Adjustment APPROVED → TXN $transactionId");
+
+                // Find invoice that used this transaction
+                $invoiceId = CE_Lib::dbQuery(
+                    "SELECT id FROM invoices WHERE transaction_id = ? LIMIT 1",
+                    [$transactionId],
+                    'scalar'
+                );
+
+                if ($invoiceId) {
+                    $invoice = new Invoice($invoiceId);
+                    $user    = new User($invoice->getUserID());
+
+                    $cPlugin = new Plugin($invoiceId, 'paddle', $user);
+                    $cPlugin->m_TransactionID = $transactionId;
+                    $cPlugin->m_Action        = 'refund';
+
+                    // Use the full amount from the original invoice
+                    $cPlugin->PaymentRefunded($invoice->getTotal(), "Paddle Refund Approved (Adjustment)", $transactionId);
+
+                    CE_Lib::log(4, "Invoice #$invoiceId automatically marked REFUNDED via webhook.");
+                }
+            }
+        }
 
         header("HTTP/1.1 200 OK");
     }
