@@ -74,7 +74,7 @@ class PluginPaddle extends GatewayPlugin
                         'name'        => "Invoice #$invoiceId",
                         'product_id'  => $productId,
                         'unit_price'  => [
-                            'amount' => (string)round($amount * 100), // Paddle requires cents as a string
+                            'amount' => (string)round($amount * 100),
                             'currency_code' => $currency
                         ]
                     ]
@@ -140,34 +140,69 @@ class PluginPaddle extends GatewayPlugin
         return "Paddle API Error: " . $errorMessage;
     }
 
-        function credit($params)
+    function credit($params)
     {
-        $transactionId = $params['invoiceRefundTransactionId'] ?? '';
-        $reason        = $params['invoiceRefundReason'] ?: 'Requested by Admin';
-        $invoiceId     = (int)($params['invoiceNumber'] ?? 0);
-
-        // Support refund from the invoices list view
-        if ($invoiceId === 0 && !empty($params['items'][0])) {
-            $invoiceId = (int)$params['items'][0];
-        }
+        $transactionId   = $params['invoiceRefundTransactionId'] ?? '';
+        $reason          = $params['invoiceRefundReason'] ?: 'Requested by Admin';
+        $invoiceId       = (int)($params['invoiceNumber'] ?? ($params['items'][0] ?? 0));
+        $requestedAmount = round($params['invoiceRefundAmount'] ?? $params['amount'] ?? 0, 2);
 
         if (empty($transactionId) || $invoiceId === 0) {
             throw new Exception("Paddle Refund Error: Missing transaction ID or invoice ID.");
         }
 
-        CE_Lib::log(4, "Paddle Refund Attempt → Invoice #$invoiceId | TXN: $transactionId | Reason: $reason");
-
-        $payload = [
-            'action'         => 'refund',
-            'transaction_id' => $transactionId,
-            'reason'         => $reason,
-            'type'           => 'full'
-        ];
+        CE_Lib::log(4, "Paddle Refund Attempt → Invoice #$invoiceId | TXN: $transactionId | Requested: " . ($requestedAmount ?: 'FULL'));
 
         $isTest = $this->getVariable('Test Mode');
         $apiKey = $this->getVariable('API Key');
         $apiUrl = ($isTest == 1) ? 'https://sandbox-api.paddle.com' : 'https://api.paddle.com';
 
+        // Fetch transaction to get line item ID (required for partial refunds)
+        $ch = curl_init("$apiUrl/transactions/$transactionId");
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            "Authorization: Bearer $apiKey",
+            "Accept: application/json"
+        ]);
+        $txResponse = curl_exec($ch);
+        $txCode     = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        $txData = json_decode($txResponse, true);
+        if ($txCode !== 200 || empty($txData['data']['details']['line_items'][0]['id'])) {
+            throw new Exception("Paddle Refund Error: Could not fetch transaction details.");
+        }
+
+        $lineItemId    = $txData['data']['details']['line_items'][0]['id'];
+        $originalTotal = round(($txData['data']['details']['totals']['total'] ?? 0) / 100, 2);
+
+        $isPartial = ($requestedAmount > 0 && $requestedAmount < $originalTotal);
+
+        // Build payload
+        if ($isPartial) {
+            $refundCents = round($requestedAmount * 100);
+            $payload = [
+                'action'         => 'refund',
+                'transaction_id' => $transactionId,
+                'reason'         => $reason,
+                'type'           => 'partial',
+                'items'          => [
+                    [
+                        'item_id' => $lineItemId,
+                        'amount'  => (string)$refundCents
+                    ]
+                ]
+            ];
+        } else {
+            $payload = [
+                'action'         => 'refund',
+                'transaction_id' => $transactionId,
+                'reason'         => $reason,
+                'type'           => 'full'
+            ];
+        }
+
+        // Create the adjustment
         $ch = curl_init("$apiUrl/adjustments");
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_POST, true);
@@ -197,36 +232,27 @@ class PluginPaddle extends GatewayPlugin
             $adjId  = $result['data']['id'];
             $status = $result['data']['status'] ?? 'unknown';
 
-            // Get the exact refunded amount from Paddle response (in cents → dollars)
+            // Use exact amount Paddle returned
             $refundAmount = round(($result['data']['totals']['total'] ?? 0) / 100, 2);
 
-            if ($refundAmount <= 0) {
-                $refundAmount = 0.00; // fallback, should never happen
-            }
+            CE_Lib::log(4, "Paddle " . ($isPartial ? "Partial" : "Full") . " Refund Accepted → Adj: $adjId | Status: $status | Amount: $refundAmount");
 
-            CE_Lib::log(4, "Paddle Refund Accepted → Adjustment: $adjId | Status: $status | Amount: $refundAmount");
-
-            // Mark invoice as refunded
             $cPlugin = new Plugin($invoiceId, 'paddle', $this->user);
             $cPlugin->m_TransactionID = $transactionId;
             $cPlugin->m_Action        = 'refund';
 
             $cPlugin->PaymentRefunded(
                 $refundAmount,
-                "Paddle Refund (Adj ID: $adjId - $status)",
+                "Paddle " . ($isPartial ? "Partial " : "") . "Refund (Adj ID: $adjId - $status)",
                 $adjId
             );
 
             CE_Lib::log(4, "✅ Invoice #$invoiceId marked REFUNDED ($refundAmount)");
 
-                        return '';   // empty return = clean success in Clientexec
+            return '';   // Clean success (no "Failed to refund" message)
         }
 
-        $errorMsg = $result['error']['detail'] 
-                 ?? $result['error']['message'] 
-                 ?? $response 
-                 ?? 'Unknown error';
-
+        $errorMsg = $result['error']['detail'] ?? $result['error']['message'] ?? 'Unknown error';
         CE_Lib::log(1, "Paddle Refund FAILED: $errorMsg");
         throw new Exception("Paddle Refund Error: $errorMsg");
     }
