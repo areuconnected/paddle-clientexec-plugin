@@ -1,4 +1,8 @@
 <?php
+// EXACT SAME LOADING AS OFFICIAL PAYPAL GATEWAY
+chdir('../../../');
+require_once dirname(__FILE__).'/../../../library/front.php';
+
 require_once 'modules/admin/models/PluginCallback.php';
 require_once 'modules/billing/models/class.gateway.plugin.php';
 require_once 'modules/billing/models/Invoice.php';
@@ -17,52 +21,52 @@ class PluginPaddleCallback extends PluginCallback
 
         $eventType = $data['event_type'];
         $innerData = $data['data'] ?? [];
-        $invoiceId = (int)($innerData['custom_data']['invoice_id'] ?? 0);
-        $transactionId = $innerData['id'] ?? '';
-        
-        // Paddle totals are in cents
-        $amountInCents = $innerData['details']['totals']['total'] ?? 0;
-        $amount = number_format($amountInCents / 100, 2, '.', ''); 
 
-        if ($invoiceId === 0) return;
-
+        // ====================== TRANSACTION PAID ======================
         if ($eventType === 'transaction.completed' || $eventType === 'transaction.paid') {
+            $invoiceId     = (int)($innerData['custom_data']['invoice_id'] ?? 0);
+            $transactionId = $innerData['id'] ?? '';
+            $amountInCents = $innerData['details']['totals']['total'] ?? 0;
+            $amount        = number_format($amountInCents / 100, 2, '.', '');
+
+            if ($invoiceId === 0) return;
+
             CE_Lib::log(4, "Paddle Processing: Applying $amount to Invoice $invoiceId");
-            
+
             try {
-                // Load the Invoice and User to give Clientexec the context it needs 
-                // to send emails and trigger the server provisioning automatically.
                 $invoice = new Invoice($invoiceId);
-                $user = new User($invoice->getUserID());
-                
+                $user    = new User($invoice->getUserID());
+
                 $cPlugin = new Plugin($invoiceId, 'paddle', $user);
                 $cPlugin->m_TransactionID = $transactionId;
-                $cPlugin->m_Action = 'charge';
-                
+                $cPlugin->m_Action        = 'charge';
+
                 $cPlugin->PaymentAccepted($amount, "Paddle TXN: $transactionId", $transactionId);
-                
                 CE_Lib::log(4, "Paddle Processing: Payment successfully applied.");
             } catch (Throwable $e) {
-                // If anything crashes, catch it and log the exact error!
-                CE_Lib::log(1, "Paddle Callback Crash: " . $e->getMessage() . " in " . $e->getFile() . " on line " . $e->getLine());
+                CE_Lib::log(1, "Paddle Callback Crash: " . $e->getMessage());
             }
         }
-                elseif ($eventType === 'adjustment.updated') {
-            $adj = $innerData;
+
+        // ====================== PADDLE REFUND (FULL OR PARTIAL) ======================
+        elseif (in_array($eventType, ['adjustment.created', 'adjustment.updated'])) {
+            $adj           = $innerData;
             $status        = $adj['status'] ?? '';
+            $adjId         = $adj['id'] ?? '';
             $transactionId = $adj['transaction_id'] ?? '';
+            $refundCents   = $adj['totals']['total'] ?? 0;
+            $refundAmount  = round($refundCents / 100, 2);
 
-            if ($status === 'approved' && $transactionId) {
-                CE_Lib::log(4, "Paddle Adjustment APPROVED → TXN $transactionId");
+            if (in_array($status, ['approved', 'completed']) && $transactionId && $refundAmount > 0) {
+                CE_Lib::log(4, "Paddle Adjustment $status → TXN $transactionId | Adj: $adjId | Amount: $refundAmount");
 
-                // Find invoice that used this transaction
-                $invoiceId = CE_Lib::dbQuery(
-                    "SELECT id FROM invoices WHERE transaction_id = ? LIMIT 1",
-                    [$transactionId],
-                    'scalar'
-                );
+                // OFFICIAL CLIENTEXEC WAY (same as PayPal gateway)
+                $cPlugin = new Plugin();
+                $found   = $cPlugin->retrieveInvoiceForTransaction($transactionId);
 
-                if ($invoiceId) {
+                if ($found) {
+                    $invoiceId = $cPlugin->m_ID;
+
                     $invoice = new Invoice($invoiceId);
                     $user    = new User($invoice->getUserID());
 
@@ -70,13 +74,19 @@ class PluginPaddleCallback extends PluginCallback
                     $cPlugin->m_TransactionID = $transactionId;
                     $cPlugin->m_Action        = 'refund';
 
-                    // Use the full amount from the original invoice
-                    $cPlugin->PaymentRefunded($invoice->getTotal(), "Paddle Refund Approved (Adjustment)", $transactionId);
+                    $cPlugin->PaymentRefunded(
+                        $refundAmount,
+                        "Paddle Refund (Adj ID: $adjId - $status)",
+                        $adjId
+                    );
 
-                    CE_Lib::log(4, "Invoice #$invoiceId automatically marked REFUNDED via webhook.");
+                    CE_Lib::log(4, "✅ Invoice #$invoiceId automatically marked REFUNDED ($refundAmount) via webhook.");
+                } else {
+                    CE_Lib::log(4, "Paddle Refund webhook: No matching invoice found for TXN $transactionId");
                 }
             }
         }
+        // ============================================================================
 
         header("HTTP/1.1 200 OK");
     }
