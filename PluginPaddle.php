@@ -1,6 +1,9 @@
 <?php
 require_once 'modules/admin/models/GatewayPlugin.php';
 require_once 'modules/billing/models/class.gateway.plugin.php';
+// Added to manually fetch missing data on direct links
+require_once 'modules/billing/models/Invoice.php';
+require_once 'modules/clients/models/User.php';
 
 class PluginPaddle extends GatewayPlugin
 {
@@ -48,7 +51,28 @@ class PluginPaddle extends GatewayPlugin
 
     function singlepayment($params)
     {
-        $clientCountry = isset($params['userCountry']) ? strtoupper(trim($params['userCountry'])) : '';
+        $invoiceId = $params['invoiceNumber'];
+
+        // ==========================================
+        // SAFE DATA EXTRACTION (Fix for Direct Links)
+        // ==========================================
+        // Direct email links often drop the $params array. We manually load the invoice and user to be safe.
+        $ceInvoice  = new Invoice($invoiceId);
+        $ceCustomer = new User($ceInvoice->getUserID());
+
+        // If invoice is already paid, abort immediately to prevent Paddle errors
+        if ($ceInvoice->status == 1) {
+            return "<div style='padding: 15px; margin-top: 15px; background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; border-radius: 4px; text-align: center;'>" . lang("This invoice has already been paid.") . "</div>";
+        }
+
+        // Safely extract required data, falling back to database models if $params is empty
+        $clientCountry = !empty($params['userCountry']) ? strtoupper(trim($params['userCountry'])) : strtoupper(trim($ceCustomer->getCountry()));
+        $amount        = !empty($params['invoiceTotal']) ? round($params['invoiceTotal'], 2) : round($ceInvoice->getPrice(), 2);
+        $currency      = !empty($params['userCurrency']) ? strtoupper($params['userCurrency']) : strtoupper($ceCustomer->getCurrency());
+        $email         = !empty($params['userEmail']) ? $params['userEmail'] : $ceCustomer->getEmail();
+
+        // ==========================================
+
         $excludedStr   = $this->getVariable('Excluded Countries');
         
         if (!empty($excludedStr) && !empty($clientCountry)) {
@@ -58,17 +82,16 @@ class PluginPaddle extends GatewayPlugin
             }
         }
 
-        $invoiceId     = $params['invoiceNumber'];
-        $amount        = round($params['invoiceTotal'], 2);
-        $currency      = strtoupper($params['userCurrency']);
         $isTest        = $this->getVariable('Test Mode');
         $apiKey        = $this->getVariable('API Key');
         $clientToken   = $this->getVariable('Client-Side Token');
         $productId     = trim($this->getVariable('Product ID'));
-        $email         = $params['userEmail'];
 
         $apiUrl = ($isTest == 1) ? 'https://sandbox-api.paddle.com' : 'https://api.paddle.com';
         $envScript = ($isTest == 1) ? "Paddle.Environment.set('sandbox');" : "";
+
+        // Fallback for invoice URLs if $params drops them
+        $successUrl = !empty($params['invoiceviewURLSuccess']) ? $params['invoiceviewURLSuccess'] : $this->settings->get('Clientexec URL') . "/index.php?fuse=billing&paid=1&controller=invoice&view=invoice&id=" . $invoiceId;
 
         $payload = [
             'items' => [[
@@ -131,7 +154,7 @@ class PluginPaddle extends GatewayPlugin
                                     displayMode: 'overlay', 
                                     theme: 'light', 
                                     locale: 'en',
-                                    successUrl: '{$params['invoiceviewURLSuccess']}' 
+                                    successUrl: '{$successUrl}' 
                                 },
                                 customer: {
                                     email: '{$email}'
